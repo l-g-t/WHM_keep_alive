@@ -24,7 +24,7 @@ def send_tg_log():
     beijing_now = utc_now + timedelta(hours=8)
     now_str = beijing_now.strftime("%Y-%m-%d %H:%M:%S") + " UTC+8"
 
-    final_msg = f"📌 Netlib 保活执行日志\n🕒 {now_str}\n\n" + "\n".join(log_buffer)
+    final_msg = f"📌 webhostmost 保活执行日志\n🕒 {now_str}\n\n" + "\n".join(log_buffer)
 
     for i in range(0, len(final_msg), 3900):
         chunk = final_msg[i:i+3900]
