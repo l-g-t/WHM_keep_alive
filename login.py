@@ -59,113 +59,280 @@ fail_msgs = [
     "Error with the login: login size should be between 2 and 50 (currently: 1)"
 ]
 
-def login_account(playwright, USER, PWD):
-    log(f"🚀 开始登录账号: {USER}")
-    try:
-        # 启动浏览器
-        browser = playwright.chromium.launch(headless=True)
-        context = browser.new_context()
-        page = context.new_page()
-
-        # 打开登录页面
-        page.goto("https://client.webhostmost.com/login", timeout=60000)
-        page.wait_for_load_state("networkidle")
-        time.sleep(2)
-
-        # === Step 1: 寻找用户名/邮箱输入框 ===
-        input_filled = False
-        for selector in ["#inputEmail", "#inputUsername", "input[name='username']", "input[name='email']"]:
-            try:
-                page.wait_for_selector(selector, timeout=5000)
-                page.fill(selector, USER)
-                log(f"📝 使用字段 {selector} 填入用户名/邮箱")
-                input_filled = True
-                break
-            except:
-                continue
-
-        if not input_filled:
-            log("❌ 未找到可用的用户名/邮箱输入框，终止登录")
-            context.close()
-            browser.close()
-            return
-
-        # === Step 2: 填写密码 ===
+def login_account(playwright, USER, PWD, max_retries: int = 2):
+    """
+    稳健版登录函数：
+    - 支持 username/email 字段的多 selector 回退
+    - 提交时尝试多种点击/提交策略
+    - 出错时自动重试（默认重试 2 次）
+    - 出错时保存截图与部分 HTML 以便调试
+    """
+    attempt = 0
+    while attempt <= max_retries:
+        attempt += 1
+        log(f"🚀 开始登录账号: {USER} (尝试 {attempt}/{max_retries + 1})")
+        browser = None
+        context = None
+        page = None
         try:
-            page.wait_for_selector("#inputPassword", timeout=10000)
-            page.fill("#inputPassword", PWD)
-        except:
-            log("❌ 未找到密码输入框，终止登录")
-            context.close()
-            browser.close()
-            return
+            # 启动浏览器
+            browser = playwright.chromium.launch(headless=True)
+            context = browser.new_context()
+            page = context.new_page()
 
-        time.sleep(1)
+            # 打开登录页面
+            page.goto("https://client.webhostmost.com/login", timeout=60000)
+            page.wait_for_load_state("networkidle", timeout=60000)
+            time.sleep(1)
 
-        # === Step 3: 提交表单 ===
-        button_labels = ["Login", "Sign in", "Validate", "Submit", "Email"]
-        clicked = False
-        for label in button_labels:
-            try:
-                page.get_by_role("button", name=label).click(timeout=3000)
-                log(f"🔘 点击按钮 '{label}' 尝试登录")
-                clicked = True
-                break
-            except:
-                continue
-
-        if not clicked:
-            log("⚠️ 未找到登录按钮，尝试回车提交（可能页面会自动响应）")
-            try:
-                page.evaluate("document.querySelector('form').submit()")
-            except:
+            # === Step 1: 寻找用户名/邮箱输入框（容错） ===
+            input_selectors = [
+                "#inputEmail", "#inputUsername", "#username", "input[name='username']",
+                "input[name='email']", "input[type='email']"
+            ]
+            input_filled = False
+            for selector in input_selectors:
                 try:
-                    page.press("#inputPassword", "Enter")
+                    page.wait_for_selector(selector, timeout=5000)
+                    page.fill(selector, USER)
+                    log(f"📝 使用字段 {selector} 填入用户名/邮箱")
+                    input_filled = True
+                    break
+                except Exception:
+                    continue
+
+            if not input_filled:
+                log("❌ 未找到可用的用户名/邮箱输入框，终止本次尝试")
+                raise RuntimeError("no-username-field")
+
+            # === Step 2: 填写密码（容错） ===
+            password_selectors = ["#inputPassword", "input[name='password']", "input[type='password']", "#password"]
+            pw_filled = False
+            for selector in password_selectors:
+                try:
+                    page.wait_for_selector(selector, timeout=5000)
+                    page.fill(selector, PWD)
+                    log(f"🔒 使用字段 {selector} 填入密码")
+                    pw_filled = True
+                    break
+                except Exception:
+                    continue
+
+            if not pw_filled:
+                log("❌ 未找到密码输入框，终止本次尝试")
+                raise RuntimeError("no-password-field")
+
+            time.sleep(0.8)
+
+            # === Step 3: 提交表单（多策略） ===
+            submitted = False
+
+            # 1) 尝试 role/button 文本点击（优先）
+            button_labels = ["Login", "Sign in", "Sign In", "SignIn", "Validate", "Submit", "Log in"]
+            for label in button_labels:
+                try:
+                    page.get_by_role("button", name=label).click(timeout=3000)
+                    log(f"🔘 点击角色按钮: '{label}'")
+                    submitted = True
+                    break
+                except Exception:
+                    continue
+
+            # 2) 尝试常见 submit 选择器（button/input）
+            if not submitted:
+                css_candidates = [
+                    "button[type='submit']",
+                    "input[type='submit']",
+                    "button.btn-primary",
+                    "button.btn",
+                    ".btn-login",
+                    ".login-btn",
+                    "form button",
+                    "form input[type='submit']"
+                ]
+                for sel in css_candidates:
+                    try:
+                        # 使用 locator.first 以应对多个匹配
+                        locator = page.locator(sel)
+                        if locator.count() and locator.first.is_visible():
+                            locator.first.click(timeout=4000)
+                            log(f"🔘 点击 CSS 按钮: {sel}")
+                            submitted = True
+                            break
+                    except Exception:
+                        continue
+
+            # 3) 尝试触发表单 submit via JS
+            if not submitted:
+                try:
+                    # 先尝试找到 form 并调用 submit
+                    page.evaluate("""
+                        () => {
+                            const f = document.querySelector('form');
+                            if (f) { f.submit(); return true; }
+                            return false;
+                        }
+                    """)
+                    log("🔘 使用 document.querySelector('form').submit() 提交表单（JS 提交）")
+                    submitted = True
+                except Exception:
+                    pass
+
+            # 4) 最后尝试回车键（回退）
+            if not submitted:
+                try:
+                    # 回车可能不会触发，但值得尝试
+                    page.press("input:focus, textarea:focus, #inputPassword", "Enter")
+                    log("🔘 发送回车键尝试提交")
+                    submitted = True
+                except Exception:
+                    # 如果上面都失败，记录警告，但继续等待（页面可能已自动提交）
+                    log("⚠️ 未找到明显的提交方式，已尝试所有策略（Click/CSS/JS/Enter）")
+
+            # === Step 4: 等待跳转或页面变化（加长等待） ===
+            try:
+                page.wait_for_load_state("networkidle", timeout=60000)
+            except Exception:
+                # 仍然继续，因为有些页面不进行 full navigation，而是局部渲染
+                log("⚠️ page.wait_for_load_state('networkidle') 超时，但将继续检查页面内容")
+
+            # 给异步 JS 留点时间渲染
+            time.sleep(3)
+
+            # === Step 5: 智能结果判断（等待短时间以确认结果） ===
+            success_signs = [
+                "exclusive owner of the following domains",
+                "My Services",
+                "Client Area",
+                "Dashboard"
+            ]
+            fail_msgs = [
+                "Invalid login details",
+                "Incorrect username or password",
+                "Login failed",
+                "Your credentials are incorrect"
+            ]
+
+            # 等待并轮询检查一定时间内是否出现成功或失败提示
+            check_timeout = 30  # seconds
+            poll_interval = 2
+            end_time = time.time() + check_timeout
+            success_detected = False
+            failed_msg = None
+
+            while time.time() < end_time:
+                # 检查成功标识
+                for sign in success_signs:
+                    try:
+                        if page.query_selector(f"text={sign}"):
+                            success_detected = True
+                            break
+                    except:
+                        continue
+                if success_detected:
+                    break
+
+                # 检查失败标识
+                for msg in fail_msgs:
+                    try:
+                        if page.query_selector(f"text={msg}"):
+                            failed_msg = msg
+                            break
+                    except:
+                        continue
+                if failed_msg:
+                    break
+
+                # 检查 URL 是否跳转到可能的 dashboard 路径
+                try:
+                    cur = page.url or ""
+                    if any(x in cur for x in ["/dashboard", "/clientarea", "/home", "/account"]):
+                        success_detected = True
+                        break
                 except:
-                    log("⚠️ 回车提交失败，可能页面结构特殊")
+                    pass
 
-        # === Step 4: 等待跳转或加载 ===
-        page.wait_for_load_state("networkidle")
-        time.sleep(5)
+                time.sleep(poll_interval)
 
-        # === Step 5: 智能结果判断（防止前后矛盾日志） ===
-        success_signs = [
-            "exclusive owner of the following domains",
-            "My Services",
-            "Client Area",
-            "Dashboard"
-        ]
-        success_detected = any(page.query_selector(f"text={sign}") for sign in success_signs)
+            # 输出最终结果
+            if success_detected:
+                log(f"✅ 账号 {USER} 登录成功（检测到成功标识或 URL 跳转）")
+                # 成功直接返回，不做重试
+                context.close()
+                browser.close()
+                return
+            if failed_msg:
+                log(f"❌ 账号 {USER} 登录失败: {failed_msg}")
+                # 视场景决定是否重试；这里继续到重试逻辑
+                raise RuntimeError("login-failed-detected")
 
-        fail_msgs = [
-            "Invalid login details",
-            "Incorrect username or password",
-            "Login failed",
-            "Your credentials are incorrect"
-        ]
-        failed_msg = next(
-            (msg for msg in fail_msgs if page.query_selector(f"text={msg}")),
-            None
-        )
+            # 如果既无成功也无明确失败，视为不确定（可能超时或未触发）
+            log("⚠️ 未能在等待期内确认登录成功或失败，进入重试/诊断流程")
+            raise RuntimeError("login-unknown-state")
 
-        if success_detected:
-            log(f"✅ 账号 {USER} 登录成功（页面检测通过）")
-        elif failed_msg:
-            log(f"❌ 账号 {USER} 登录失败: {failed_msg}")
-        else:
-            # 如果前面报了“⚠️ 未找到按钮”等，但仍然检测到跳转，可修正日志提示
-            current_url = page.url
-            if "/dashboard" in current_url or "/clientarea" in current_url:
-                log(f"✅ 账号 {USER} 登录成功（自动跳转检测）")
+        except Exception as e:
+            # 失败时保存调试信息（截图 + HTML 前 2000 字）
+            try:
+                timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+                screenshot_path = f"screenshot_{USER.replace('@','_')}_{timestamp}.png"
+                html_path = f"page_{USER.replace('@','_')}_{timestamp}.html"
+                if page:
+                    try:
+                        page.screenshot(path=screenshot_path, full_page=True)
+                        log(f"📷 已保存截图: {screenshot_path}")
+                    except Exception as ex_s:
+                        log(f"⚠️ 保存截图失败: {ex_s}")
+                    try:
+                        content = page.content()
+                        with open(html_path, "w", encoding="utf-8") as f:
+                            f.write(content[:2000])  # 写前 2000 字节，避免过长
+                        log(f"📝 已保存页面 HTML 摘要: {html_path}")
+                    except Exception as ex_h:
+                        log(f"⚠️ 保存 HTML 失败: {ex_h}")
+            except Exception:
+                pass
+
+            log(f"❌ 账号 {USER} 尝试 ({attempt}) 发生异常: {e}")
+
+            # 如果还有重试机会，则等待小段时间再重试
+            if attempt <= max_retries:
+                wait_sec = 5 + attempt * 5
+                log(f"⏳ 等待 {wait_sec}s 后重试...")
+                try:
+                    if page:
+                        time.sleep(wait_sec)
+                except:
+                    time.sleep(wait_sec)
+                # 关闭资源并进入下一次尝试（finally-ish）
+                try:
+                    if context:
+                        context.close()
+                    if browser:
+                        browser.close()
+                except:
+                    pass
+                continue
             else:
-                log(f"❌ 账号 {USER} 登录失败: 未检测到成功标识")
+                # 无重试机会，记录最终失败并返回
+                log(f"❌ 账号 {USER} 登录最终失败（{max_retries + 1} 次尝试均未成功）")
+                try:
+                    if context:
+                        context.close()
+                    if browser:
+                        browser.close()
+                except:
+                    pass
+                return
 
-        # === Step 6: 清理资源 ===
-        context.close()
-        browser.close()
-
-    except Exception as e:
-        log(f"❌ 账号 {USER} 登录异常: {e}")
+        finally:
+            # 确保资源释放（若未在上面关闭）
+            try:
+                if context:
+                    context.close()
+                if browser:
+                    browser.close()
+            except:
+                pass
 
 
 def run():
