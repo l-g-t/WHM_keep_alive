@@ -2,8 +2,9 @@ import os
 import time
 import requests
 from datetime import datetime, timedelta
-from playwright.sync_api import sync_playwright
-import re  # 确保 re 模块在顶部导入
+# 导入 TimeoutError 以便专门捕获它
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+import re
 
 # -------------------------------
 log_buffer = []
@@ -59,11 +60,6 @@ fail_msgs = [
     "Not connected to server.",
     "Error with the login: login size should be between 2 and 50 (currently: 1)"
 ]
-
-# 注意：确保 re 模块已在文件顶部导入
-# import re
-# import time
-# from datetime import datetime
 
 def login_account(playwright, USER, PWD, max_retries: int = 2):
     attempt = 0
@@ -143,44 +139,76 @@ def login_account(playwright, USER, PWD, max_retries: int = 2):
             if any(sign.lower() in html.lower() for sign in success_signs):
                 log(f"✅ 账号 {USER} 登录成功")
 
-                # === ✅ Step 6: 登录成功后获取倒计时信息 (已更新支持多语言) ===
+                # === ✅ Step 6: (混合模式：优先并发等待，失败时遍历检查) ===
+                
+                # 各种语言的倒计时提示文本
+                countdown_phrases = {
+                    "EN": "Time until suspension",
+                    "NL": "Tijd tot opschorting",
+                    "JP": "停止までの時間",
+                    "ES": "Tiempo hasta la suspensión",
+                    "DE": "Zeit bis zur Sperrung"
+                }
+                
                 try:
-                    # 各种语言的倒计时提示文本
-                    countdown_phrases = [
-                        "Time until suspension",      # 英文 (English)
-                        "Tijd tot opschorting",       # 荷兰文 (Dutch)
-                        "停止までの時間",             # 日文 (Japanese)
-                        "Tiempo hasta la suspensión", # 西班牙文 (Spanish)
-                        "Zeit bis zur Sperrung"       # 德文 (German)
-                    ]
+                    # --- 阶段1: 并发等待 (最高效) ---
+                    log("🔍 正在并发等待 5 种语言的倒计时...")
                     
                     # 构建不区分大小写的正则表达式
-                    regex_pattern = "|".join(re.escape(t) for t in countdown_phrases)
-                    # 使用 Playwright 的正则表达式文本选择器 ( /.../i )
+                    regex_pattern = "|".join(re.escape(t) for t in countdown_phrases.values())
                     selector_regex = f"text=/{regex_pattern}/i"
                     
-                    # 等待包含倒计时特征文本的元素出现（最多等待10秒）
+                    # 等待任意一个出现 (10秒超时)
                     page.wait_for_selector(selector_regex, timeout=10000)
-                    log("🔍 检测到倒计时相关文本元素")
-
-                    # 获取包含这段文本的完整内容
-                    countdown_elem = page.query_selector(selector_regex)
-                    countdown_text = countdown_elem.text_content().strip() if countdown_elem else ""
                     
-                    if not countdown_text:
-                        log("⚠️ 未能获取倒计时元素的具体文本")
-                        raise Exception("Element found but text could not be retrieved")
+                    # 获取匹配到的那个元素的文本
+                    countdown_elem = page.query_selector(selector_regex)
+                    countdown_text = countdown_elem.text_content().strip()
+                    log(f"🔍 并发等待成功，检测到文本: {countdown_text}")
 
-                    # 用正则提取时间段（如“44d 23h 57m 40s”）
-                    # 假设时间格式 (d h m s) 在所有语言中都是统一的
+                    # 用正则提取时间段
                     match = re.search(r"(\d+d\s+\d+h\s+\d+m\s+\d+s)", countdown_text)
                     if match:
                         remaining_time = match.group(1)
                         log(f"⏱️ 登录后检测到倒计时: {remaining_time}")
                     else:
                         log(f"⚠️ 登录成功，检测到文本 '{countdown_text}'，但未匹配到时间格式")
+
+                except PlaywrightTimeoutError:
+                    # --- 阶段2: 并发等待超时，执行用户要求的“遍历”来复核 ---
+                    log(f"⚠️ 并发等待 10 秒超时，未检测到倒计时。")
+                    log("🔍 开始遍历复核 (使用 is_visible 检查当前页面)...")
+                    
+                    found_in_loop = False
+                    for lang, phrase in countdown_phrases.items():
+                        selector = f"text=/{re.escape(phrase)}/i"
+                        elem = page.locator(selector).first
+                        
+                        # is_visible() 是立即检查，不等待
+                        if elem.is_visible():
+                            log(f"🔍 [遍历复核] ✅ 找到 ({lang}): '{phrase}'")
+                            found_in_loop = True
+                            # （理论上阶段1会捕获到，这里是备用逻辑）
+                            try:
+                                found_text = elem.text_content().strip()
+                                match = re.search(r"(\d+d\s+\d+h\s+\d+m\s+\d+s)", found_text)
+                                if match:
+                                    remaining_time = match.group(1)
+                                    log(f"⏱️ [遍历复核] 提取倒计时: {remaining_time}")
+                                else:
+                                    log(f"⚠️ [遍历复核] 虽找到文本，但未匹配到时间格式: {found_text}")
+                            except Exception as e_inner:
+                                log(f"⚠️ [遍历复核] 提取文本时出错: {e_inner}")
+                            break # 找到一个就行
+                        else:
+                            log(f"🔍 [遍历复核] ❌ 未立即可见 ({lang}): '{phrase}'")
+                    
+                    if not found_in_loop:
+                        log("⚠️ [遍历复核] 确认页面上当前无倒计时显示。")
+
                 except Exception as e:
-                    log(f"⚠️ 登录成功，但提取倒计时时出错: {e}")
+                    # 捕获其他所有异常
+                    log(f"⚠️ 登录成功，但在提取/处理倒计时文本时出错: {e}")
                 # === Step 6 结束 ===
 
                 # 清理资源
@@ -215,8 +243,6 @@ def login_account(playwright, USER, PWD, max_retries: int = 2):
                 except:
                     pass
                 return
-
-
 
 def run():
     with sync_playwright() as playwright:
