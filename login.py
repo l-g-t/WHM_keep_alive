@@ -110,7 +110,8 @@ def login_account(playwright, USER, PWD, max_retries: int = 2):
             button_labels = ["Login", "Sign in", "Sign In", "Validate", "Submit", "Log in"]
             for label in button_labels:
                 try:
-                    page.get_by_role("button", name=label).click(timeout=3000)
+                    # 使用 text= 匹配按钮文本
+                    page.get_by_role("button", name=label, exact=True).click(timeout=3000)
                     log(f"🔘 点击按钮 '{label}'")
                     submitted = True
                     break
@@ -133,24 +134,24 @@ def login_account(playwright, USER, PWD, max_retries: int = 2):
 
             # === Step 5: 检查登录结果 ===
             success_signs = ["Client Area", "Dashboard", "My Services"]
-            fail_msgs = ["Invalid login", "Incorrect", "Login failed"]
+            fail_msgs_check = ["Invalid login", "Incorrect", "Login failed"] # 避免与外部变量名冲突
 
             html = page.content()
             if any(sign.lower() in html.lower() for sign in success_signs):
                 log(f"✅ 账号 {USER} 登录成功")
 
-                # === ✅ Step 6: (混合模式：优先并发等待，失败时遍历检查) ===
+                # === ✅ Step 6: 倒计时检查 (修复荷兰语匹配问题) ===
                 
-                # --- 修改点开始 ---
-                # 各种语言的倒计时提示文本 (根据您的反馈更新了 NL 和 DE)
+                # 各种语言的倒计时提示文本。
+                # 修复点：将带有冒号的语言的短语去除冒号 (如 "Tijd tot schorsing:") 
+                # 以提高 Playwright 'text=' 文本定位的鲁棒性，同时保留时间提取的有效性。
                 countdown_phrases = {
-                    "EN": "Time until suspension",      # 英文 (根据日志，这个不带冒号)
-                    "NL": "Tijd tot schorsing:",       # 荷兰文 (使用您提供的精确字符串)
-                    "DE": "Zeit bis zur Sperrung:",       # 德文 (使用您提供的精确字符串)
-                    "JP": "停止までの時間:",             # 日文 (推测带冒号)
-                    "ES": "Tiempo hasta la suspensión:" # 西班牙文 (推测带冒号)
+                    "EN": "Time until suspension",          # 英文 (不带冒号)
+                    "NL": "Tijd tot schorsing",            # 修复：去除冒号
+                    "DE": "Zeit bis zur Sperrung",         # 修复：去除冒号
+                    "JP": "停止までの時間",                # 修复：去除冒号
+                    "ES": "Tiempo hasta la suspensión"     # 修复：去除冒号
                 }
-                # --- 修改点结束 ---
                 
                 try:
                     # --- 阶段1: 并发等待 (最高效) ---
@@ -161,14 +162,19 @@ def login_account(playwright, USER, PWD, max_retries: int = 2):
                     selector_regex = f"text=/{regex_pattern}/i"
                     
                     # 等待任意一个出现 (10秒超时)
+                    # 匹配到后，Playwright 会返回包含该文本的元素，该元素的 text_content() 应该包含完整倒计时
                     page.wait_for_selector(selector_regex, timeout=10000)
                     
                     # 获取匹配到的那个元素的文本
                     countdown_elem = page.query_selector(selector_regex)
+                    if not countdown_elem:
+                        # 应该在 wait_for_selector 处捕获，但作为后备检查
+                        raise RuntimeError("Element not found after waiting.")
+                    
                     countdown_text = countdown_elem.text_content().strip()
-                    log(f"🔍 并发等待成功，检测到文本: {countdown_text}")
+                    log(f"🔍 并发等待成功，检测到元素文本: {countdown_text}")
 
-                    # 用正则提取时间段
+                    # 用正则提取时间段 (格式: 44d 23h 59m 19s)
                     match = re.search(r"(\d+d\s+\d+h\s+\d+m\s+\d+s)", countdown_text)
                     if match:
                         remaining_time = match.group(1)
@@ -182,8 +188,9 @@ def login_account(playwright, USER, PWD, max_retries: int = 2):
                     log("🔍 开始遍历复核 (使用 is_visible 检查当前页面)...")
                     
                     found_in_loop = False
+                    # 遍历复核仍使用去除冒号后的短语
                     for lang, phrase in countdown_phrases.items():
-                        # 使用 re.escape 确保特殊字符(如冒号)被正确处理
+                        # 使用 re.escape 确保特殊字符被正确处理
                         selector = f"text=/{re.escape(phrase)}/i"
                         elem = page.locator(selector).first
                         
@@ -191,7 +198,7 @@ def login_account(playwright, USER, PWD, max_retries: int = 2):
                         if elem.is_visible():
                             log(f"🔍 [遍历复核] ✅ 找到 ({lang}): '{phrase}'")
                             found_in_loop = True
-                            # （理论上阶段1会捕获到，这里是备用逻辑）
+                            
                             try:
                                 found_text = elem.text_content().strip()
                                 match = re.search(r"(\d+d\s+\d+h\s+\d+m\s+\d+s)", found_text)
@@ -219,11 +226,12 @@ def login_account(playwright, USER, PWD, max_retries: int = 2):
                 browser.close()
                 return
 
-            elif any(msg.lower() in html.lower() for msg in fail_msgs):
+            elif any(msg.lower() in html.lower() for msg in fail_msgs_check):
                 log(f"❌ 账号 {USER} 登录失败（检测到错误提示）")
                 raise RuntimeError("login-failed")
             else:
                 log("⚠️ 未检测到成功或失败标识，可能页面延迟或结构变化")
+                # 抛出异常以触发重试
                 raise RuntimeError("login-unknown")
 
         except Exception as e:
@@ -248,6 +256,9 @@ def login_account(playwright, USER, PWD, max_retries: int = 2):
                 return
 
 def run():
+    if not accounts:
+        log("❌ 未配置 SITE_ACCOUNTS 环境变量，请按 'username,password;...' 格式配置")
+        return
     with sync_playwright() as playwright:
         for acc in accounts:
             login_account(playwright, acc["username"], acc["password"])
@@ -255,4 +266,4 @@ def run():
 
 if __name__ == "__main__":
     run()
-    send_tg_log()  # 发送日志
+    send_tg_log() # 发送日志
