@@ -172,7 +172,7 @@ def login_account(playwright, USER, PWD, max_retries: int = 2):
                         raise RuntimeError("Element not found after waiting.")
                     
                     countdown_text = countdown_elem.text_content().strip()
-                    log(f"🔍 并发等待成功，检测到元素文本: {countdown_text}")
+    #                log(f"🔍 并发等待成功，检测到元素文本: {countdown_text}")
 
                     # 用正则提取时间段 (格式: 44d 23h 59m 19s)
                     match = re.search(r"(\d+d\s+\d+h\s+\d+m\s+\d+s)", countdown_text)
